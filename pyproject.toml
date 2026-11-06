@@ -13,10 +13,19 @@ description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
-    "triton>=3.0.0",
     "transformers>=4.51.0",
-    "flash-attn",
     "xxhash",
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "triton>=3.0.0",
+    "flash-attn",
+]
+npu = [
+    "torch_npu>=2.9.0",
 ]
 
 [project.urls]

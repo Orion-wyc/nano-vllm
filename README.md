@@ -22,6 +22,20 @@ A lightweight vLLM implementation built from scratch.
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
+## Ascend NPU (A3)
+
+nano-vllm can run on Ascend 910_93 (A3) with `torch_npu`. The port keeps the CUDA
+flash-attn path and adds an NPU paged-attention path plus native Qwen3.5 hybrid
+attention support.
+
+```bash
+bash scripts/setup_a3_env.sh
+bash scripts/run_a3_example.sh
+```
+
+See [docs/A3_NPU_ADAPTATION.md](docs/A3_NPU_ADAPTATION.md) for environment setup,
+remote A3 verification with `npu-dev`, limitations, and reproduction steps.
+
 ## Model Download
 
 To download the model weights manually, use the following command:

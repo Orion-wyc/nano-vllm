@@ -21,6 +21,7 @@ class BaseRouter:
         sampling_params: SamplingParams,
         request_id: str | None = None,
         stop: list[str] | None = None,
+        kv_transfer_params: dict | None = None,
     ) -> AsyncIterator[dict]:
         raise NotImplementedError
         yield
@@ -44,6 +45,7 @@ class SingleRouter(BaseRouter):
         sampling_params: SamplingParams,
         request_id: str | None = None,
         stop: list[str] | None = None,
+        kv_transfer_params: dict | None = None,
     ) -> AsyncIterator[dict]:
         async for event in self.engine.generate(prompt, sampling_params, request_id=request_id, stop=stop):
             yield event
@@ -75,6 +77,7 @@ class RoundRobinRouter(BaseRouter):
         sampling_params: SamplingParams,
         request_id: str | None = None,
         stop: list[str] | None = None,
+        kv_transfer_params: dict | None = None,
     ) -> AsyncIterator[dict]:
         engine = await self._select()
         async for event in engine.generate(prompt, sampling_params, request_id=request_id, stop=stop):
@@ -111,10 +114,43 @@ async def create_router(args) -> BaseRouter:
     device_id = _arg(args, "device_id", 0)
     tp = _arg(args, "tensor_parallel_size", 1)
     workers = _arg(args, "workers", 1)
+    role = _arg(args, "role", "regular")
+    if role not in ("regular", "prefill", "decode"):
+        raise ValueError(f"unsupported worker role: {role}")
+    if role != "regular" and _arg(args, "pd", False):
+        raise ValueError("--role cannot be combined with in-process --pd")
     if workers < 1:
         raise ValueError("workers must be at least 1")
-    if tp != 1 and (_arg(args, "pd", False) or workers > 1):
+    if role != "regular" and workers != 1:
+        raise ValueError("PD worker roles require --workers 1")
+    if tp != 1 and (_arg(args, "pd", False) or workers > 1 or role != "regular"):
         raise ValueError("PD and multiple workers currently require tensor_parallel_size=1")
+    if role == "prefill":
+        from nanovllm.engine.llm_engine import LLMEngine
+
+        from .pd_worker import PrefillWorkerRouter
+
+        advertise_url = _arg(args, "advertise_url", None)
+        if not advertise_url:
+            host = _arg(args, "host", "127.0.0.1")
+            port = _arg(args, "port", 8000)
+            advertise_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+            advertise_url = f"http://{advertise_host}:{port}"
+        engine = LLMEngine(model, **_engine_kwargs(args, device_id))
+        router = PrefillWorkerRouter(
+            engine,
+            advertise_url,
+            _arg(args, "kv_transfer_ttl", 300.0),
+        )
+        router.worker_id = _arg(args, "worker_id", None)
+        return router
+    if role == "decode":
+        from .pd_worker import DecodeWorkerRouter
+
+        engine = AsyncLLMEngine(model, **_engine_kwargs(args, device_id))
+        router = DecodeWorkerRouter(engine, _arg(args, "kv_fetch_timeout", 120.0))
+        router.worker_id = _arg(args, "worker_id", None)
+        return router
     if _arg(args, "pd", False):
         from nanovllm.engine.llm_engine import LLMEngine
 

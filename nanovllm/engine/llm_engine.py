@@ -81,11 +81,14 @@ class LLMEngine:
     def has_work(self) -> bool:
         return not self.scheduler.is_finished()
 
-    def prefill(self, prompt, sampling_params):
+    def prefill(self, prompt, sampling_params, hold_blocks: bool = False):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         self._validate_request(prompt, sampling_params)
         seq = Sequence(prompt, sampling_params)
+        if hold_blocks:
+            seq.ignore_eos = True
+            seq.max_tokens = max(seq.max_tokens, seq.num_prompt_tokens + 2)
         self.scheduler.add(seq)
         while not seq.is_finished and seq.num_cached_tokens < seq.num_prompt_tokens:
             seqs, is_prefill = self.scheduler.schedule()

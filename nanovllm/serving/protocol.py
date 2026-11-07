@@ -13,6 +13,7 @@ class CompletionRequest(BaseModel):
     top_p: float = Field(default=1.0, gt=0, le=1)
     top_k: int = -1
     repetition_penalty: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    kv_transfer_params: dict | None = None
 
     @field_validator("top_k")
     @classmethod
@@ -45,6 +46,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = Field(default=1.0, gt=0, le=1)
     top_k: int = -1
     repetition_penalty: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    kv_transfer_params: dict | None = None
 
     @field_validator("top_k")
     @classmethod

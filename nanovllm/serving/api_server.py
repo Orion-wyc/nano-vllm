@@ -5,8 +5,8 @@ import uuid
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.serving.protocol import ChatCompletionRequest, CompletionRequest
@@ -28,6 +28,13 @@ def _usage(event) -> tuple[int, int, int]:
     return prompt_tokens, completion_tokens, prompt_tokens + completion_tokens
 
 
+def _attach_event_extras(payload: dict, event: dict) -> None:
+    for key in ("kv_transfer_params", "worker_role", "worker_id", "pd_transfer", "token_ids"):
+        value = event.get(key)
+        if value is not None:
+            payload[key] = value
+
+
 def _register_routes(app: FastAPI, model_name: str) -> None:
 
     @app.get("/health")
@@ -37,6 +44,46 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
     @app.get("/v1/models")
     async def models():
         return {"object": "list", "data": [{"id": model_name, "object": "model"}]}
+
+    @app.get("/health_generate")
+    async def health_generate():
+        return PlainTextResponse("ok")
+
+    @app.get("/get_server_info")
+    async def get_server_info():
+        engine_router = app.state.router
+        engine = getattr(engine_router, "engine", None)
+        config = getattr(engine, "config", None)
+        if config is None:
+            config = getattr(getattr(engine, "engine", None), "config", None)
+        return {
+            "model": model_name,
+            "worker_role": getattr(app.state, "worker_role", "regular"),
+            "worker_id": getattr(app.state, "worker_id", None),
+            "dp_size": 1,
+            "block_size": getattr(config, "kvcache_block_size", None),
+            "max_model_len": getattr(config, "max_model_len", None),
+            "load_in_flight": getattr(engine_router, "inflight", 0),
+        }
+
+    @app.get("/get_load")
+    async def get_load():
+        engine_router = app.state.router
+        return {"load": getattr(engine_router, "inflight", 0)}
+
+    @app.post("/flush_cache")
+    async def flush_cache():
+        return PlainTextResponse("ok")
+
+    @app.get("/internal/pd/transfer/{transfer_id}")
+    async def get_pd_transfer(transfer_id: str):
+        store = getattr(app.state.router, "transfer_store", None)
+        if store is None:
+            raise HTTPException(status_code=404, detail="PD transfer store is not available")
+        payload = store.get(transfer_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="PD transfer payload not found")
+        return Response(content=payload, media_type="application/octet-stream")
 
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest):
@@ -64,6 +111,7 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
                         sampling_params,
                         request_id=request_id,
                         stop=stop,
+                        kv_transfer_params=req.kv_transfer_params,
                     ):
                         chunk = {
                             "id": request_id,
@@ -95,6 +143,7 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
                 sampling_params,
                 request_id=request_id,
                 stop=stop,
+                kv_transfer_params=req.kv_transfer_params,
             ):
                 last_event = event
         except Exception as exc:
@@ -102,7 +151,7 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
         if last_event is None:
             raise HTTPException(status_code=500, detail="generation produced no output")
         prompt_tokens, completion_tokens, total_tokens = _usage(last_event)
-        return {
+        payload = {
             "id": request_id,
             "object": "text_completion",
             "created": created,
@@ -120,6 +169,8 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
                 "total_tokens": total_tokens,
             },
         }
+        _attach_event_extras(payload, last_event)
+        return payload
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
@@ -156,6 +207,7 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
                         sampling_params,
                         request_id=request_id,
                         stop=stop,
+                        kv_transfer_params=req.kv_transfer_params,
                     ):
                         chunk = {
                             "id": request_id,
@@ -187,6 +239,7 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
                 sampling_params,
                 request_id=request_id,
                 stop=stop,
+                kv_transfer_params=req.kv_transfer_params,
             ):
                 last_event = event
         except Exception as exc:
@@ -194,7 +247,7 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
         if last_event is None:
             raise HTTPException(status_code=500, detail="generation produced no output")
         prompt_tokens, completion_tokens, total_tokens = _usage(last_event)
-        return {
+        payload = {
             "id": request_id,
             "object": "chat.completion",
             "created": created,
@@ -215,12 +268,17 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
                 "total_tokens": total_tokens,
             },
         }
+        _attach_event_extras(payload, last_event)
+        return payload
 
 
-def create_app(router: BaseRouter, model_name: str) -> FastAPI:
+def create_app(router: BaseRouter, model_name: str, worker_role: str | None = None) -> FastAPI:
     app = FastAPI()
     app.state.router = router
     app.state.model_name = model_name
+    if worker_role is None:
+        worker_role = getattr(router, "worker_role", "regular")
+    app.state.worker_role = worker_role
     _register_routes(app, model_name)
     return app
 
@@ -242,13 +300,31 @@ def main():
     parser.add_argument("--pd", action="store_true")
     parser.add_argument("--prefill-device", type=int, default=0)
     parser.add_argument("--decode-device", type=int, default=1)
+    parser.add_argument(
+        "--role",
+        choices=("regular", "prefill", "decode"),
+        default="regular",
+        help="Worker role when serving behind vllm-router PD disaggregation",
+    )
+    parser.add_argument(
+        "--advertise-url",
+        default=None,
+        help="URL that decode workers use to fetch staged KV from this prefill worker",
+    )
+    parser.add_argument("--kv-transfer-ttl", type=float, default=300.0)
+    parser.add_argument("--kv-fetch-timeout", type=float, default=120.0)
+    parser.add_argument("--worker-id", default=None)
     args = parser.parse_args()
+    if args.worker_id is None:
+        args.worker_id = f"{args.role}-{args.port}"
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         router = await create_router(args)
         app.state.router = router
         app.state.model_name = args.model
+        app.state.worker_role = args.role
+        app.state.worker_id = args.worker_id
         try:
             yield
         finally:

@@ -36,6 +36,7 @@ class PDRouter(BaseRouter):
         sampling_params: SamplingParams,
         request_id: str | None = None,
         stop: list[str] | None = None,
+        kv_transfer_params: dict | None = None,
     ) -> AsyncIterator[dict]:
         if request_id is None:
             request_id = str(uuid.uuid4())

@@ -61,6 +61,20 @@ On a single-device machine, set `NANO_VLLM_DECODE_DEVICE=0` for the PD scripts.
 See [docs/SERVING.md](docs/SERVING.md) for endpoints, streaming, multi-worker,
 PD mode, and A3 NPU examples.
 
+### PD with vllm-router
+
+Run prefill and decode on two cards and register both with `vllm-router`:
+
+```bash
+bash scripts/run_pd_router_demo.sh
+python scripts/verify_pd_router.py
+```
+
+The prefill worker stages KV cache and Qwen3.5 recurrent state; the decode
+worker fetches it through vllm-router's `kv_transfer_params` handoff. See
+[docs/PD_ROUTER.md](docs/PD_ROUTER.md) for architecture, protocol, load
+balancing, and remote A3 verification.
+
 ## Model Download
 
 To download the model weights manually, use the following command:

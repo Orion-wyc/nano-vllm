@@ -46,17 +46,7 @@ curl -sS http://127.0.0.1:8000/v1/completions \
   -d '{"prompt":"Once upon a time","max_tokens":64,"temperature":0.7,"top_p":0.8,"top_k":20,"repetition_penalty":1.1}'
 ```
 
-如需使用两张 NPU 执行同进程 PD 分离，在环境准备完成后，将上面的单设备启动命令替换为：
-
-```bash
-python -m nanovllm.serving.api_server \
-  --model "$NANO_VLLM_MODEL" \
-  --host 0.0.0.0 --port 8000 --pd \
-  --prefill-device 0 --decode-device 1 --tp 1 --enforce-eager \
-  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 512
-```
-
-PD 模式使用上面相同的 HTTP 端点；KV 和 Qwen3.5 的线性注意力状态经 CPU 中转，当前不支持跨节点传输。
+如需使用两张 NPU 执行 PD 分离，推荐按 5.3 启动两个独立 worker 并注册到 vllm-router。单进程 `--pd` 模式适合 CPU 或单 device 调试，说明见 5.2。
 
 ## 1. 组件
 
@@ -231,37 +221,118 @@ python -m nanovllm.serving.api_server \
 
 每个 worker 创建一个 `AsyncLLMEngine`，设备编号从 `--device-id` 开始依次递增，请求由 `RoundRobinRouter` 轮询分发。
 
-### 5.2 PD 模式
+### 5.2 单进程 PD 模式
+
+单进程 PD 使用一个同步 `LLMEngine` 做 prefill，一个 `AsyncLLMEngine` 做 decode，适合 CPU 或单 device 调试。当前 A3 环境下同时加载两个引擎可能受 torch_npu/驱动状态影响，不作为两卡 NPU 复现路径；两卡 NPU 请使用 5.3 的独立 worker + vllm-router 模式。
+
+单 device 启动（device 0）：
 
 ```bash
 python -m nanovllm.serving.api_server \
-  --model /path/to/model \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --pd \
-  --prefill-device 0 \
-  --decode-device 1
+  --model "$NANO_VLLM_MODEL" \
+  --host 0.0.0.0 --port 8000 \
+  --pd --prefill-device 0 --decode-device 0 \
+  --tp 1 --enforce-eager \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 512
 ```
 
-PD 模式使用一个同步 `LLMEngine` 做 prefill，一个 `AsyncLLMEngine` 做 decode：
+PD 模式的行为：
 
 - prefill 引擎执行 prompt 并导出 KV cache；Qwen3.5 还会导出线性注意力 state。
 - 导出结果通过 CPU staging 传给 decode 引擎，decode 引擎导入后继续生成。
 - 同一时刻只处理一个 prefill，prefill 与 decode 串行执行，没有 overlap。
 - 数据在同一进程内传递，没有跨节点网络传输。
-- PD 暂不支持 `tensor_parallel_size > 1`。
-- prefill 和 decode 使用同一个 device 时，`create_router` 会把 `--gpu-memory-utilization` 自动减半，避免两个引擎同时按 90% 申请 KV cache。
+- 单进程 PD 暂不支持 `tensor_parallel_size > 1`。
+- prefill 和 decode 使用同一个 device 时，`create_router` 会把 `--gpu-memory-utilization` 自动减半。
 
-单设备环境可以让两个引擎共用 device 0：
+启动后直接发请求：
+
+```bash
+curl -sS http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:8000/v1/models
+
+curl -sS http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is 1+1?","max_tokens":8,"temperature":0}'
+
+curl -N http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is 1+1?","max_tokens":8,"temperature":0,"stream":true}'
+
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":8,"temperature":0}'
+```
+
+如果运行环境支持两个引擎同时驻留，可以使用 device 0 做 prefill、device 1 做 decode：
 
 ```bash
 python -m nanovllm.serving.api_server \
-  --model /path/to/model \
+  --model "$NANO_VLLM_MODEL" \
   --port 8000 \
-  --pd \
-  --prefill-device 0 \
-  --decode-device 0
+  --pd --prefill-device 0 --decode-device 1 \
+  --tp 1 --enforce-eager \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 512
 ```
+
+### 5.3 两卡 PD 与 vllm-router
+
+`--pd` 是单进程内的 PD 分离。若要让 prefill 和 decode 分别跑在两张卡上，并由外部 vllm-router 做接入、路由和负载均衡，使用 worker 角色启动。
+
+三终端分别在 NPU 节点执行：
+
+```bash
+# 终端 1：card 0，prefill worker
+python -m nanovllm.serving.api_server --model "$NANO_VLLM_MODEL" \
+  --host 127.0.0.1 --port 8101 --device-id 0 --role prefill \
+  --advertise-url http://127.0.0.1:8101 --enforce-eager \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 512
+
+# 终端 2：card 1，decode worker
+python -m nanovllm.serving.api_server --model "$NANO_VLLM_MODEL" \
+  --host 127.0.0.1 --port 8102 --device-id 1 --role decode \
+  --enforce-eager --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 512
+
+# 终端 3：vllm-router
+export VLLM_ROUTER_BIN=${VLLM_ROUTER_BIN:-/mnt/workspace/Works/vllm-router/target/release/vllm-router}
+"$VLLM_ROUTER_BIN" --host 127.0.0.1 --port 8080 \
+  --vllm-pd-disaggregation \
+  --prefill http://127.0.0.1:8101 none \
+  --decode http://127.0.0.1:8102 \
+  --policy round_robin
+```
+
+prefill worker 导出 KV cache 和 Qwen3.5 线性注意力 state，decode worker 通过 `/internal/pd/transfer/{id}` 拉取。请求统一发到 router：
+
+```bash
+curl -sS http://127.0.0.1:8101/health
+curl -sS http://127.0.0.1:8102/health
+curl -sS http://127.0.0.1:8080/health
+
+curl -sS http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is 1+1?","max_tokens":8,"temperature":0}'
+
+curl -N http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is 1+1?","max_tokens":8,"temperature":0,"stream":true}'
+
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":8,"temperature":0}'
+```
+
+`/v1/completions` 和 `/v1/chat/completions` 的非流式响应会带有：
+
+```json
+{
+  "worker_role": "decode",
+  "worker_id": "decode-1",
+  "pd_transfer": true
+}
+```
+
+`pd_transfer=true` 表示 decode worker 使用了 prefill 阶段导出的 KV/state。一键启动脚本为 `scripts/run_pd_router_demo.sh`，自动验证为 `scripts/verify_pd_router.py`，更完整的协议说明见 [PD_ROUTER.md](PD_ROUTER.md)。
 
 ## 6. 验证脚本
 
@@ -300,7 +371,9 @@ python scripts/verify_api_server.py
 | `NANO_VLLM_DEVICE_ID` | `0` |
 | `NANO_VLLM_API_TIMEOUT` | `600` 秒，等待服务就绪 |
 
-### 6.3 PD 模式
+### 6.3 单进程 PD 模式
+
+以下脚本用于单进程 PD 的引擎对拍，建议在 CPU 或单 device 环境运行；A3 两卡 PD 使用 6.4 的 `verify_pd_router.py`。
 
 ```bash
 python scripts/verify_pd.py
@@ -328,96 +401,186 @@ python scripts/verify_pd_concurrent.py
 
 单设备环境设置 `NANO_VLLM_DECODE_DEVICE=0` 即可。
 
-### 6.4 CPU 与 NPU
+### 6.4 两卡 PD + vllm-router
 
-CPU 上直接运行，设备参数保持默认或设为 0：
+在 NPU 环境中执行：
+
+```bash
+source /home/developer/Ascend/cann-9.3.0/set_env.sh
+cd /mnt/workspace/Works/nano-vllm
+source /mnt/workspace/Envs/nano_vllm_a3/bin/activate
+export NANO_VLLM_MODEL=/home/developer/models/models/Qwen--Qwen3.5-0.8B/snapshots/master
+export VLLM_ROUTER_BIN=/mnt/workspace/Works/vllm-router/target/release/vllm-router
+
+python scripts/verify_pd_router.py
+```
+
+脚本启动 prefill/decode worker 和 vllm-router，验证 PD 路由、`pd_transfer` 标记、流式响应，并比较 router 返回文本与单请求直接生成结果。也可以按 5.3 的步骤手工启动后，用 curl 直接发请求，两种方式等价。
+
+### 6.5 NPU 环境中运行验证脚本
+
+服务化复现统一在 NPU 环境执行。每个新终端先加载环境：
+
+```bash
+source /home/developer/Ascend/cann-9.3.0/set_env.sh
+cd /mnt/workspace/Works/nano-vllm
+source /mnt/workspace/Envs/nano_vllm_a3/bin/activate
+export NANO_VLLM_MODEL=/home/developer/models/models/Qwen--Qwen3.5-0.8B/snapshots/master
+```
+
+依次运行：
+
+```bash
+python scripts/verify_async_engine.py
+python scripts/verify_api_server.py
+NANO_VLLM_PREFILL_DEVICE=0 NANO_VLLM_DECODE_DEVICE=1 python scripts/verify_pd_router.py
+```
+
+`verify_pd.py` 和 `verify_pd_concurrent.py` 是单进程 PD 的引擎对拍脚本，建议在 CPU 或单 device 环境运行。
+
+CPU 只用于数值对拍，不作为服务化复现环境。CPU 上可运行：
 
 ```bash
 python scripts/verify_async_engine.py
 NANO_VLLM_DECODE_DEVICE=0 python scripts/verify_pd.py
 ```
 
-NPU 上先加载 CANN 并激活虚拟环境：
+## 7. NPU 环境服务化复现清单
+
+### 7.1 环境
 
 ```bash
 source /home/developer/Ascend/cann-9.3.0/set_env.sh
 cd /mnt/workspace/Works/nano-vllm
 source /mnt/workspace/Envs/nano_vllm_a3/bin/activate
 export NANO_VLLM_MODEL=/home/developer/models/models/Qwen--Qwen3.5-0.8B/snapshots/master
-
-python scripts/verify_async_engine.py
-python scripts/verify_api_server.py
-NANO_VLLM_PREFILL_DEVICE=0 NANO_VLLM_DECODE_DEVICE=1 python scripts/verify_pd.py
+pip install -e '.[serving]'
 ```
 
-## 7. A3 NPU 运行示例
+`npu-smi info` 应能看到两张可用设备。本文命令使用 device 0 和 device 1。
+
+### 7.2 单 worker 服务
 
 ```bash
-source /home/developer/Ascend/cann-9.3.0/set_env.sh
-cd /mnt/workspace/Works/nano-vllm
-source /mnt/workspace/Envs/nano_vllm_a3/bin/activate
-export NANO_VLLM_MODEL=/home/developer/models/models/Qwen--Qwen3.5-0.8B/snapshots/master
-
-pip install -e '.[serving]'
-
 python -m nanovllm.serving.api_server \
   --model "$NANO_VLLM_MODEL" \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --device-id 0 \
-  --enforce-eager \
-  --max-model-len 512 \
-  --max-num-seqs 8 \
-  --max-num-batched-tokens 512
+  --host 0.0.0.0 --port 8000 \
+  --device-id 0 --tp 1 --enforce-eager \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 512
 ```
 
-另开终端验证：
+另开终端直接验证：
 
 ```bash
-curl -s http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:8000/v1/models
+
+curl -sS http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Hello, introduce yourself in one sentence.","max_tokens":8,"temperature":0}'
+
+curl -N http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Hello, introduce yourself in one sentence.","max_tokens":8,"temperature":0,"stream":true}'
+
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"1+10086等于多少？"}],"max_tokens":8,"temperature":0}'
+```
+
+### 7.3 单进程 PD 服务（CPU/单 device 调试）
+
+单进程 PD 适合 CPU 或单 device 调试。A3 两卡复现使用 7.4。
+
+```bash
+python -m nanovllm.serving.api_server \
+  --model "$NANO_VLLM_MODEL" \
+  --host 0.0.0.0 --port 8000 \
+  --pd --prefill-device 0 --decode-device 0 \
+  --tp 1 --enforce-eager \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 512
+```
+
+curl 命令与 7.2 相同，直接发到 `http://127.0.0.1:8000`。
+
+### 7.4 两卡 PD + vllm-router 服务
+
+按 5.3 启动 prefill worker（8101）、decode worker（8102）和 router（8080），然后：
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is 1+1?","max_tokens":8,"temperature":0}'
+
+curl -N http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is 1+1?","max_tokens":8,"temperature":0,"stream":true}'
+
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is 1+1?"}],"max_tokens":8,"temperature":0}'
+```
+
+### 7.5 自动化验证
+
+```bash
+python scripts/verify_async_engine.py
 python scripts/verify_api_server.py
+python scripts/verify_pd_router.py
+```
+
+`verify_pd.py` 和 `verify_pd_concurrent.py` 用于单进程 PD 的引擎对拍，建议在 CPU 或单 device 环境运行。
+
+或一键启动两卡 PD 服务并发送 smoke 请求：
+
+```bash
+KEEP_RUNNING=0 SMOKE_REQUEST=1 bash scripts/run_pd_router_demo.sh
 ```
 
 ## 8. 验证结果
 
-### 8.1 CPU
+### 8.1 Ascend 910_93 (A3)
 
-已验证：
-
-- `verify_async_engine.py`：异步事件流完整，最后事件 `finished=true`。
-- `verify_api_server.py`：`/health`、`/v1/models`、非流式补全、SSE 流式补全、chat completions 均通过。
-- `verify_pd.py`：PD 与直接生成 token_ids 完全一致。
-- `verify_pd_concurrent.py`：两个并发 PD 请求，包含 160 token 长 prompt，均与直接生成完全一致。
-
-### 8.2 Ascend 910_93 (A3)
-
-远程 A3 上已验证：
+在 NPU 节点上已验证：
 
 - `verify_async_engine.py`：device 0 上正常生成。
-- `verify_pd.py`：prefill device 0、decode device 1，PD 与直接生成 token_ids 完全一致。
-- `verify_pd_concurrent.py`：device 0/1 上两个并发 PD 请求，token_ids 完全一致。
-- `verify_api_server.py`：device 0 上 API Server 的非流式、SSE、chat 均通过。
-- PD API Server：`--pd --prefill-device 0 --decode-device 1`，`/v1/completions` 非流式和流式均通过。
+- `verify_api_server.py`：device 0 上 `/health`、`/v1/models`、非流式补全、SSE 流式补全、chat completions 均通过；curl 直发同样通过。
+- 两卡 PD + vllm-router：device 0 运行 prefill worker、device 1 运行 decode worker，router 使用 `--vllm-pd-disaggregation --policy round_robin`。curl 非流式、流式和 chat 均通过，`pd_transfer=true`，返回文本与单请求直接生成完全一致。
+- `scripts/run_pd_router_demo.sh`：`KEEP_RUNNING=0 SMOKE_REQUEST=1` 在 A3 上完成两卡启动和 smoke 请求。
 
-关键验证命令：
+当前 A3 环境未将单进程 `--pd` 的双 device 启动作为验证项；两卡 PD 以 5.3 的独立 worker 模式为准。单进程 PD 引擎对拍见 8.2 CPU。
+
+关键命令：
 
 ```bash
 source /home/developer/Ascend/cann-9.3.0/set_env.sh
 cd /mnt/workspace/Works/nano-vllm
 source /mnt/workspace/Envs/nano_vllm_a3/bin/activate
 export NANO_VLLM_MODEL=/home/developer/models/models/Qwen--Qwen3.5-0.8B/snapshots/master
+export VLLM_ROUTER_BIN=/mnt/workspace/Works/vllm-router/target/release/vllm-router
 
 python scripts/verify_async_engine.py
 python scripts/verify_api_server.py
-python scripts/verify_pd.py
-python scripts/verify_pd_concurrent.py
+python scripts/verify_pd_router.py
 ```
+
+### 8.2 CPU
+
+CPU 仅用于数值对拍和快速调试：
+
+- `verify_async_engine.py`：异步事件流完整，最后事件 `finished=true`。
+- `verify_api_server.py`：`/health`、`/v1/models`、非流式补全、SSE 流式补全、chat completions 均通过。
+- `verify_pd.py`：PD 与直接生成 token_ids 完全一致。
+- `verify_pd_router.py`：两卡 PD 路由在 CPU 上同样通过，用于不占用 NPU 时排查代码问题。
 
 ## 9. 已知限制
 
 - 每个请求的 prefill 串行执行，长 prompt 会阻塞其他请求的 prefill。
-- PD 模式的 KV cache 和线性 state 只在本进程内通过 CPU staging 传递，没有跨节点网络传输。
+- 单进程 `--pd` 的 KV cache 和线性 state 只在本进程内通过 CPU staging 传递。
+- 单进程 `--pd` 在两个 NPU device 上同时加载两个引擎，当前 A3 环境可能受 torch_npu/驱动状态影响；两卡 PD 请使用独立 worker + vllm-router（5.3）。
+- 两卡 `--role prefill/decode` 通过 HTTP 拉取 KV/state，未接入 NIXL、Mooncake 或 RDMA。
 - PD 模式暂不支持 `tensor_parallel_size > 1`。
+- 内部 `/internal/pd/transfer/{id}` 端点没有鉴权，只能用于同机或可信网络。
 - 服务没有认证、限流和指标导出。
 - 多 worker 在同一进程内轮询请求，不是独立进程模型。
 - Qwen3.5 在 NPU/CPU 上保持 eager，未接入图执行。

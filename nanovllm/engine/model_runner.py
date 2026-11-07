@@ -1,7 +1,6 @@
 import datetime
 import os
 import pickle
-import socket
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -28,12 +27,7 @@ from nanovllm.utils.device import (
     tensor_from_list,
 )
 from nanovllm.utils.loader import load_model
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+from nanovllm.utils.parallel_state import set_parallel_state
 
 
 class ModelRunner:
@@ -44,20 +38,19 @@ class ModelRunner:
         self.block_size = config.kvcache_block_size
         self.world_size = config.tensor_parallel_size
         self.rank = rank
+        self.device_index = config.device_id + rank
         self.event = event
 
-        set_device(rank)
-        if self.world_size == 1:
-            backend = "gloo"
-            port = _free_port()
-        else:
+        set_device(self.device_index)
+        if self.world_size > 1:
             backend = dist_backend()
             port = int(os.environ.get("NANO_VLLM_DIST_PORT", "2333"))
-        timeout = datetime.timedelta(seconds=int(os.environ.get("NANO_VLLM_DIST_TIMEOUT", "300")))
-        dist.init_process_group(backend, f"tcp://127.0.0.1:{port}", world_size=self.world_size, rank=rank, timeout=timeout)
+            timeout = datetime.timedelta(seconds=int(os.environ.get("NANO_VLLM_DIST_TIMEOUT", "300")))
+            dist.init_process_group(backend, f"tcp://127.0.0.1:{port}", world_size=self.world_size, rank=rank, timeout=timeout)
+        set_parallel_state(rank, self.world_size)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(config.text_config.dtype)
-        torch.set_default_device(device(rank).type)
+        torch.set_default_device(device(self.device_index).type)
         if config.model_type.startswith("qwen3_5"):
             from nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
             self.model = Qwen3_5ForCausalLM(config.text_config)
@@ -91,10 +84,13 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs, self.graph_pool
-        synchronize()
-        dist.destroy_process_group()
+            if not self.enforce_eager:
+                del self.graphs, self.graph_pool
+            synchronize()
+            dist.destroy_process_group()
+        else:
+            synchronize()
+        empty_cache()
 
     def loop(self):
         while True:
@@ -168,7 +164,7 @@ class ModelRunner:
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32)
-        return to_device(block_tables, self.rank)
+        return to_device(block_tables, self.device_index)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -207,12 +203,12 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if (self.use_paged_attention and all(seq.block_table for seq in seqs)) or cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = tensor_from_list(input_ids, torch.int64, self.rank)
-        positions = tensor_from_list(positions, torch.int64, self.rank)
-        cu_seqlens_q = tensor_from_list(cu_seqlens_q, torch.int32, self.rank)
-        cu_seqlens_k = tensor_from_list(cu_seqlens_k, torch.int32, self.rank)
-        slot_mapping = tensor_from_list(slot_mapping, torch.int32, self.rank)
-        context_lens = tensor_from_list(context_lens, torch.int32, self.rank)
+        input_ids = tensor_from_list(input_ids, torch.int64, self.device_index)
+        positions = tensor_from_list(positions, torch.int64, self.device_index)
+        cu_seqlens_q = tensor_from_list(cu_seqlens_q, torch.int32, self.device_index)
+        cu_seqlens_k = tensor_from_list(cu_seqlens_k, torch.int32, self.device_index)
+        slot_mapping = tensor_from_list(slot_mapping, torch.int32, self.device_index)
+        context_lens = tensor_from_list(context_lens, torch.int32, self.device_index)
         state_slots = [seq.state_slot if seq.state_slot >= 0 else 0 for seq in seqs]
         reset_slots = [slot for seq, slot in zip(seqs, state_slots) if seq.num_cached_tokens == 0]
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, state_slots, reset_slots)
@@ -228,10 +224,10 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = tensor_from_list(input_ids, torch.int64, self.rank)
-        positions = tensor_from_list(positions, torch.int64, self.rank)
-        slot_mapping = tensor_from_list(slot_mapping, torch.int32, self.rank)
-        context_lens = tensor_from_list(context_lens, torch.int32, self.rank)
+        input_ids = tensor_from_list(input_ids, torch.int64, self.device_index)
+        positions = tensor_from_list(positions, torch.int64, self.device_index)
+        slot_mapping = tensor_from_list(slot_mapping, torch.int32, self.device_index)
+        context_lens = tensor_from_list(context_lens, torch.int32, self.device_index)
         block_tables = self.prepare_block_tables(seqs)
         state_slots = [seq.state_slot if seq.state_slot >= 0 else 0 for seq in seqs]
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, state_slots=state_slots, reset_slots=None)
@@ -240,7 +236,7 @@ class ModelRunner:
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32)
-        return to_device(temperatures, self.rank)
+        return to_device(temperatures, self.device_index)
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -262,12 +258,30 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        set_device(self.device_index)
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, seqs).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def export_kv(self, block_ids: list[int]) -> torch.Tensor:
+        ids = torch.tensor(block_ids, dtype=torch.long, device=self.kv_cache.device)
+        return self.kv_cache.index_select(2, ids).detach().cpu().clone()
+
+    def import_kv(self, block_ids: list[int], kv: torch.Tensor) -> None:
+        source = kv.to(self.kv_cache.device, dtype=self.kv_cache.dtype)
+        for source_index, block_id in enumerate(block_ids):
+            self.kv_cache[:, :, block_id].copy_(source[:, :, source_index])
+
+    def export_state(self, slot: int):
+        if hasattr(self.model, "export_state"):
+            return self.model.export_state(slot)
+        return None
+
+    def import_state(self, slot: int, state):
+        if hasattr(self.model, "import_state") and state is not None:
+            self.model.import_state(slot, state)
 
     @torch.inference_mode()
     def capture_cudagraph(self):

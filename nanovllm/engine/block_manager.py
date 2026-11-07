@@ -59,6 +59,8 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
+        if seq.state_slot == -1 and not self.free_state_slots:
+            return -1
         if not self.enable_prefix_caching:
             if len(self.free_block_ids) < seq.num_blocks:
                 return -1
@@ -100,6 +102,15 @@ class BlockManager:
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
+
+    def import_sequence(self, seq: Sequence, num_blocks: int) -> list[int]:
+        assert not seq.block_table
+        block_ids = [self._allocate_block() for _ in range(num_blocks)]
+        if seq.state_slot == -1:
+            seq.state_slot = self.free_state_slots.popleft()
+            self.used_state_slots.add(seq.state_slot)
+        seq.block_table = block_ids
+        return block_ids
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):

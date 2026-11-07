@@ -36,6 +36,31 @@ bash scripts/run_a3_example.sh
 See [docs/A3_NPU_ADAPTATION.md](docs/A3_NPU_ADAPTATION.md) for environment setup,
 remote A3 verification with `npu-dev`, limitations, and reproduction steps.
 
+## Online Serving
+
+Install the serving extras and start the OpenAI-style API server:
+
+```bash
+pip install -e '.[serving]'
+python -m nanovllm.serving.api_server \
+  --model /path/to/model \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Verify the async engine, API server, and PD mode:
+
+```bash
+python scripts/verify_async_engine.py
+python scripts/verify_api_server.py
+python scripts/verify_pd.py
+python scripts/verify_pd_concurrent.py
+```
+
+On a single-device machine, set `NANO_VLLM_DECODE_DEVICE=0` for the PD scripts.
+See [docs/SERVING.md](docs/SERVING.md) for endpoints, streaming, multi-worker,
+PD mode, and A3 NPU examples.
+
 ## Model Download
 
 To download the model weights manually, use the following command:

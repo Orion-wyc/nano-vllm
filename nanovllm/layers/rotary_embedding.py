@@ -2,7 +2,7 @@ from functools import lru_cache
 import torch
 from torch import nn
 
-from nanovllm.utils.device import maybe_compile
+from nanovllm.utils.device import maybe_compile, device_type
 
 
 def apply_rotary_emb(
@@ -24,14 +24,15 @@ class RotaryEmbedding(nn.Module):
         rotary_dim: int,
         max_position_embeddings: int,
         base: float,
+        device: torch.device | None = None,
     ) -> None:
         super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
         assert rotary_dim <= head_size
         assert rotary_dim % 2 == 0
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float, device=device) / rotary_dim))
+        t = torch.arange(max_position_embeddings, dtype=torch.float, device=device)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
@@ -54,12 +55,31 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
+def _current_device_str() -> str:
+    kind = device_type()
+    if kind == "npu":
+        return f"npu:{torch.npu.current_device()}"
+    if kind == "cuda":
+        return f"cuda:{torch.cuda.current_device()}"
+    return "cpu"
+
+
+@lru_cache(8)
+def _get_rope_cached(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    device_str: str,
+):
+    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base, torch.device(device_str))
+    return rotary_emb
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
     max_position: int,
     base: float,
 ):
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+    return _get_rope_cached(head_size, rotary_dim, max_position, base, _current_device_str())

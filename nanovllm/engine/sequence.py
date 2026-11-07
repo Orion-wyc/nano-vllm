@@ -28,6 +28,9 @@ class Sequence:
         self.block_table = []
         self.state_slot = -1
         self.temperature = sampling_params.temperature
+        self.top_p = sampling_params.top_p
+        self.top_k = sampling_params.top_k
+        self.repetition_penalty = sampling_params.repetition_penalty
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
 

@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -9,6 +8,7 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.layers.linear import ReplicatedLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.utils.context import get_context
+from nanovllm.utils.parallel_state import get_world_size
 
 
 class RMSNormShifted(nn.Module):
@@ -37,7 +37,7 @@ class RMSNormGated(nn.Module):
         input_dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        x = x * self.weight.float()
+        x = x.to(input_dtype) * self.weight
         x = x * F.silu(gate.float())
         return x.to(input_dtype)
 
@@ -347,7 +347,7 @@ class Qwen3_5FullAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        assert dist.get_world_size() == 1
+        assert get_world_size() == 1
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -467,3 +467,23 @@ class Qwen3_5ForCausalLM(nn.Module):
         for layer in self.model.language_model.layers:
             if layer.layer_type == "linear_attention":
                 layer.linear_attn.allocate_state_cache(num_slots)
+
+    def export_state(self, slot: int) -> list:
+        states = []
+        for layer in self.model.language_model.layers:
+            if layer.layer_type == "linear_attention":
+                states.append((
+                    layer.linear_attn.conv_state[slot].detach().cpu().clone(),
+                    layer.linear_attn.recurrent_state[slot].detach().cpu().clone(),
+                ))
+        return states
+
+    def import_state(self, slot: int, states):
+        index = 0
+        for layer in self.model.language_model.layers:
+            if layer.layer_type == "linear_attention":
+                conv, recurrent = states[index]
+                linear_attn = layer.linear_attn
+                linear_attn.conv_state[slot].copy_(conv.to(linear_attn.conv_state.device, dtype=linear_attn.conv_state.dtype))
+                linear_attn.recurrent_state[slot].copy_(recurrent.to(linear_attn.recurrent_state.device, dtype=linear_attn.recurrent_state.dtype))
+                index += 1

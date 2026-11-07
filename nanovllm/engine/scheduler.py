@@ -22,6 +22,19 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    def abort(self, seq_id: int) -> bool:
+        for seq in list(self.waiting):
+            if seq.seq_id == seq_id:
+                self.waiting.remove(seq)
+                self.block_manager.deallocate(seq)
+                return True
+        for seq in list(self.running):
+            if seq.seq_id == seq_id:
+                self.running.remove(seq)
+                self.block_manager.deallocate(seq)
+                return True
+        return False
+
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_batched_tokens = 0

@@ -15,6 +15,9 @@ PACKAGES=(
     tokenizers
     huggingface_hub
     tqdm
+    fastapi
+    uvicorn
+    httpx
 )
 
 if [[ ! -d "$ENV_DIR" ]]; then

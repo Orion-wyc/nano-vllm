@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import threading
+
 import torch
 
 
@@ -15,15 +17,21 @@ class Context:
     state_slots: list[int] | None = None
     reset_slots: list[int] | None = None
 
-_CONTEXT = Context()
+
+_LOCAL = threading.local()
+
 
 def get_context():
-    return _CONTEXT
+    context = getattr(_LOCAL, "context", None)
+    if context is None:
+        context = Context()
+        _LOCAL.context = context
+    return context
+
 
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, state_slots=None, reset_slots=None):
-    global _CONTEXT
-    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, state_slots, reset_slots)
+    _LOCAL.context = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, state_slots, reset_slots)
+
 
 def reset_context():
-    global _CONTEXT
-    _CONTEXT = Context()
+    _LOCAL.context = Context()

@@ -28,11 +28,19 @@ def _usage(event) -> tuple[int, int, int]:
     return prompt_tokens, completion_tokens, prompt_tokens + completion_tokens
 
 
-def _attach_event_extras(payload: dict, event: dict) -> None:
+def _attach_event_extras(app: FastAPI, payload: dict, event: dict) -> None:
     for key in ("kv_transfer_params", "worker_role", "worker_id", "pd_transfer", "token_ids"):
         value = event.get(key)
         if value is not None:
             payload[key] = value
+    if "worker_role" not in payload:
+        payload["worker_role"] = getattr(app.state, "worker_role", "regular")
+    if "worker_id" not in payload:
+        worker_id = getattr(app.state, "worker_id", None)
+        if worker_id is not None:
+            payload["worker_id"] = worker_id
+    if "pd_transfer" not in payload:
+        payload["pd_transfer"] = False
 
 
 def _register_routes(app: FastAPI, model_name: str) -> None:
@@ -169,7 +177,7 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
                 "total_tokens": total_tokens,
             },
         }
-        _attach_event_extras(payload, last_event)
+        _attach_event_extras(app, payload, last_event)
         return payload
 
     @app.post("/v1/chat/completions")
@@ -268,7 +276,7 @@ def _register_routes(app: FastAPI, model_name: str) -> None:
                 "total_tokens": total_tokens,
             },
         }
-        _attach_event_extras(payload, last_event)
+        _attach_event_extras(app, payload, last_event)
         return payload
 
 

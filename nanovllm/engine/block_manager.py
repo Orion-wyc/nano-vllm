@@ -119,6 +119,14 @@ class BlockManager:
             seq.state_slot = self.free_state_slots.popleft()
             self.used_state_slots.add(seq.state_slot)
         seq.block_table = block_ids
+        if self.enable_prefix_caching:
+            h = -1
+            for index, block_id in enumerate(block_ids):
+                token_ids = seq.block(index)
+                h = self.compute_hash(token_ids, h)
+                block = self.blocks[block_id]
+                block.update(h, token_ids)
+                self.hash_to_block_id[h] = block_id
         return block_ids
 
     def deallocate(self, seq: Sequence):

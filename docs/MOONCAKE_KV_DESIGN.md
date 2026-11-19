@@ -197,6 +197,7 @@ Qwen3.5 demo 使用 `block` 策略，512 token 请求约 46 MiB；如果只关�
 3. `ModelRunner.import_state` 把状态快照写入该 slot。
 4. 设置 `seq.num_cached_tokens = k × block_size`，把序列放回 scheduler。
 5. 如果命中长度等于 prompt 长度，把 `num_cached_tokens` 回退 1 个 token，让最后一个 token 重新经过模型以产生 logits 和首个采样 token。
+6. 对全 attention 模型，导入 block 同时写入本地 `BlockManager` 的 xxhash 链，避免外部前缀与本地前缀缓存同时启用时链式哈希从 `-1` 起步。Qwen3.5 关闭本地前缀缓存，不依赖这一步。
 
 `LLMEngine.prefill` 当前在 `nanovllm/engine/llm_engine.py:84` 只接受普通 prompt；方案增加一个可选的 `external_prefix` 参数，或新增 `prefill_with_external_prefix` 方法，避免影响现有 HTTP 和 Regular 路径。
 

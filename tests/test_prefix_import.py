@@ -83,6 +83,26 @@ class PrefixImportTests(unittest.TestCase):
         manager.import_prefix_blocks(third, 1)
         self.assertEqual(third.state_slot, 0)
 
+    def test_import_prefix_blocks_seeds_local_prefix_hashes(self):
+        manager = BlockManager(
+            num_blocks=8,
+            block_size=4,
+            max_num_seqs=2,
+            enable_prefix_caching=True,
+        )
+        seq = Sequence(list(range(8)), SamplingParams())
+
+        block_ids = manager.import_prefix_blocks(seq, 2)
+
+        first = manager.blocks[block_ids[0]]
+        second = manager.blocks[block_ids[1]]
+        self.assertEqual(first.token_ids, [0, 1, 2, 3])
+        self.assertEqual(second.token_ids, [4, 5, 6, 7])
+        self.assertNotEqual(first.hash, -1)
+        self.assertNotEqual(second.hash, -1)
+        self.assertEqual(manager.hash_to_block_id[first.hash], block_ids[0])
+        self.assertEqual(manager.hash_to_block_id[second.hash], block_ids[1])
+
     def test_import_prefix_blocks_with_zero_blocks(self):
         manager = BlockManager(num_blocks=8, block_size=4, max_num_seqs=2)
         seq = Sequence([1, 2, 3], SamplingParams())

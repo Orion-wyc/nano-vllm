@@ -204,6 +204,56 @@ vllm-router 的 PD 流程与 vLLM 一致：
 
 KV 和 state 使用 `torch.save` 序列化，transfer store 默认保留 300 秒（`--kv-transfer-ttl`）。该端点没有鉴权，仅用于同机或可信网络内的 demo。
 
+### 5.1 Mooncake KV 后端
+
+上面的 HTTP 中转可以用 Mooncake Store 替换。prefill worker 把 KV block、Qwen3.5 状态快照和 manifest 写入 Mooncake；decode worker 用 router 传入的 `transfer_id` 读取 manifest，再批量拉取 KV/state。router 使用 `--kv-connector mooncake`，启动时会查询 prefill 的 bootstrap 端口 `/query` 获取 `engine_id`。
+
+```bash
+# master
+mooncake_master --rpc_port 50051
+
+# prefill worker，bootstrap 端口 8998
+python -m nanovllm.serving.api_server --model "$NANO_VLLM_MODEL" \
+  --host 127.0.0.1 --port 8101 --device-id 0 --role prefill \
+  --worker-id prefill-1 --advertise-url http://127.0.0.1:8101 \
+  --enforce-eager --max-model-len 512 --max-num-seqs 8 \
+  --max-num-batched-tokens 512 --gpu-memory-utilization 0.3 \
+  --kv-store mooncake --mooncake-master 127.0.0.1:50051 \
+  --mooncake-bootstrap-port 8998 --mooncake-state-snapshots block
+
+# decode worker
+python -m nanovllm.serving.api_server --model "$NANO_VLLM_MODEL" \
+  --host 127.0.0.1 --port 8102 --device-id 1 --role decode \
+  --worker-id decode-1 --enforce-eager --max-model-len 512 \
+  --max-num-seqs 8 --max-num-batched-tokens 512 \
+  --gpu-memory-utilization 0.3 \
+  --kv-store mooncake --mooncake-master 127.0.0.1:50051
+
+# router
+"$VLLM_ROUTER_BIN" --host 127.0.0.1 --port 8080 \
+  --vllm-pd-disaggregation --kv-connector mooncake \
+  --prefill http://127.0.0.1:8101 8998 \
+  --decode http://127.0.0.1:8102 \
+  --policy round_robin
+```
+
+请求仍然发到 router。非流式响应中的 `kv_store=mooncake` 表示 decode 从 Mooncake 拉取，`prefix_hit_blocks` 表示 prefill 命中的完整 block 数量。共享前缀的第二个请求应该看到 `prefix_hit_blocks > 0`。
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"What is 1+1?","max_tokens":8,"temperature":0}'
+```
+
+自动验证：
+
+```bash
+python scripts/verify_mooncake_store.py
+python scripts/verify_mooncake_pd.py
+```
+
+设计细节、对象格式、容量计算和失败模式见 [MOONCAKE_KV_DESIGN.md](MOONCAKE_KV_DESIGN.md)。A3 NPU 上已验证第二次共享前缀请求 `prefix_hit_blocks=1`，prefill 日志没有 `/internal/pd/transfer` 请求，返回文本与直接生成一致。
+
 ## 6. 负载均衡
 
 router 的请求级策略由 `--policy`、`--prefill-policy`、`--decode-policy` 指定，可选：

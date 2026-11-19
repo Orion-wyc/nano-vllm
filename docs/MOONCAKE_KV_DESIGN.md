@@ -58,11 +58,15 @@ Mooncake 方案使用三类对象，分别承担数据、状态和交接控制�
 
 | 对象 | 键格式 | 内容 | 典型大小 |
 | --- | --- | --- | --- |
-| KV block | `nano:kv:v1:{scope}:{prefix_hash}` | 单个 block 的 K/V tensor | 3 MiB |
-| 状态快照 | `nano:state:v1:{scope}:{prefix_hash}` | Qwen3.5 线性注意力状态 | 约 20 MiB |
+| 完整前缀 KV block | `nano:kv:v1:{scope}:{prefix_hash}` | 可被后续请求复用的单个 block | 3 MiB |
+| 请求内 KV block | `nano:kv:req:{transfer_id}:{index}` | 最后一个不完整 block 或首 token 所在 block | 3 MiB |
+| 完整前缀状态快照 | `nano:state:v1:{scope}:{prefix_hash}` | 可被后续请求复用的 block 边界状态 | 约 20 MiB |
+| 请求最终状态 | `nano:state:req:{transfer_id}` | decode 导入用的最终状态 | 约 20 MiB |
 | manifest | `nano:manifest:v1:{transfer_id}` | 请求 token、block key、state key、首 token | 1–4 KiB |
 
 `scope` 是模型和布局的命名空间，避免不同模型、dtype 或 block size 的对象互相命中。它由模型路径指纹、`text_config.dtype`、`kvcache_block_size`、KV 层数、KV head 数和对象格式版本组成，例如 `qwen3_5-0_8b-bf16-256-l6-h2-d256-v1`。模型配置变化时必须改变 `scope`，否则旧对象可能被错误复用。
+
+只有完整 block 使用前缀键，最后一个不完整 block 和首个生成 token 所在 block 使用请求内键。前缀匹配只查询完整 block 的前缀键，因此不会把“同一段 token 出现在不同位置”误判为同一前缀。manifest 同时记录两类键，decode 按顺序拉取即可。Qwen3.5 的前缀匹配还要求对应边界的状态快照存在；请求最终状态只服务本次 decode，不参与后续前缀命中。
 
 KV block 的 payload 使用 `torch.save({"version": 1, "block": tensor})` 生成字节串，tensor 形状为 `[2, num_kv_layers, 1, block_size, num_kv_heads, head_dim]`。Qwen3.5-0.8B 的 full-attention 层数为 6，`num_key_value_heads=2`，`head_dim=256`，block size 为 256，bf16 每个元素 2 字节：
 
@@ -352,6 +356,20 @@ worker 启动参数按“存储后端、Mooncake 连接、前缀策略、回退�
 | 回归 | 原有 HTTP PD、Regular S3/S4 | 原有脚本继续通过 |
 
 前缀命中的对拍方法与现有 PD 验证一致：`temperature=0`，将 router 返回文本与单请求直接 `LLMEngine.generate` 的结果比较，要求完全一致。D pull 的验证同时检查 Mooncake `put/get` 计数和 decode 日志，避免只看响应文本而误判数据来源。
+
+A3 NPU 实机已经跑通上述链路。`scripts/verify_mooncake_store.py` 在远端 NPU 上对 3 MiB 和 20 MiB 对象完成 `put/get` 往返，3 MiB 约 8 ms 写入、2 ms 读取，20 MiB 约 18 ms 写入、11 ms 读取。`scripts/verify_mooncake_pd.py` 使用 404 token 的共享前缀发送两次请求：第一次 `prefix_hit_blocks=0`，第二次 `prefix_hit_blocks=1`，两次 `kv_store=mooncake`、`pd_transfer=true`；prefill 日志中 `/internal/pd/transfer` 请求数为 0，说明 decode 确实从 Mooncake 拉取。两次返回文本与单请求直接生成完全一致。
+
+实现对应关系如下：
+
+| 模块 | 职责 |
+| --- | --- |
+| `nanovllm/serving/mooncake_store.py` | Mooncake client 封装和错误归一化 |
+| `nanovllm/serving/prefix_cache.py` | 链式哈希、前缀键、最长前缀查询 |
+| `nanovllm/serving/pd_mooncake.py` | manifest、KV/state 编解码、prefill 发布和 decode 拉取 |
+| `nanovllm/serving/pd_worker.py` | Mooncake prefill/decode 路由分支、bootstrap server 生命周期 |
+| `nanovllm/engine/llm_engine.py` | `prefill_with_prefix` 和 block 边界回调 |
+| `nanovllm/engine/model_runner.py` | 批量 KV block 导入 |
+| `nanovllm/engine/block_manager.py` | 外部前缀 block/state slot 分配 |
 
 ## 11. 设计取舍
 

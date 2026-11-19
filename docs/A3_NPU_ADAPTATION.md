@@ -533,6 +533,8 @@ python scripts/verify_async_engine.py
 python scripts/verify_api_server.py
 python scripts/verify_router_regular.py
 python scripts/verify_pd_router.py
+python scripts/verify_mooncake_store.py
+python scripts/verify_mooncake_pd.py
 ```
 
 一键启动两卡 PD 服务并发送 smoke 请求：
@@ -542,7 +544,15 @@ VLLM_ROUTER_BIN=/mnt/workspace/Works/vllm-router/target/release/vllm-router \
 KEEP_RUNNING=0 SMOKE_REQUEST=1 bash scripts/run_pd_router_demo.sh
 ```
 
+Mooncake KV 后端的一键启动和 smoke 请求：
+
+```bash
+KEEP_RUNNING=0 SMOKE_REQUEST=1 bash scripts/run_mooncake_pd_demo.sh
+```
+
 `verify_pd.py` 和 `verify_pd_concurrent.py` 是单进程 PD 的引擎对拍脚本，建议在 CPU 或单 device 环境运行。
+
+Mooncake 后端在 A3 NPU 上已验证：第二次共享前缀请求 `prefix_hit_blocks=1`，`kv_store=mooncake`，prefill 日志没有 `/internal/pd/transfer` 请求，返回文本与直接生成一致。对象模型、容量计算和失败模式见 [MOONCAKE_KV_DESIGN.md](MOONCAKE_KV_DESIGN.md)。
 
 ## 5. 环境准备与可选远程同步
 
@@ -673,6 +683,8 @@ NPU 上已验证：
 - `verify_router_regular.py`：S3/S4 通过，DP=2 分布为 4/4。
 - `verify_pd_router.py`：S5 在 `max_tokens=1/8/16` 下通过。
 - `scripts/run_pd_router_demo.sh`：`KEEP_RUNNING=0 SMOKE_REQUEST=1` 完成两卡启动和 smoke 请求。
+- Mooncake Store：`verify_mooncake_store.py` 在 NPU 上完成 3 MiB 和 20 MiB 对象读写，内容一致。
+- Mooncake PD：`verify_mooncake_pd.py` 使用 404 token 共享前缀发送两次请求，第一次 `prefix_hit_blocks=0`，第二次 `prefix_hit_blocks=1`；两次 `kv_store=mooncake`、`pd_transfer=true`，prefill 日志没有 `/internal/pd/transfer` 请求，返回文本与直接生成一致。
 
 S6 多 P/多 D：代码已支持，CPU 上验证了 2P1D；当前 NPU 只有 2 个 device，未展开多实例验证。
 
@@ -739,6 +751,10 @@ S6 多 P/多 D：代码已支持，CPU 上验证了 2P1D；当前 NPU 只有 2 �
 9. 多 P/多 D：
 
    代码已支持，当前 2 卡环境不展开 NPU 验证；CPU 2P1D 已验证。device 数量增加后按 4.6 扩展。
+
+10. Mooncake KV 后端：
+
+   先运行 `python scripts/verify_mooncake_store.py`，再运行 `python scripts/verify_mooncake_pd.py`；也可以按 4.8 的一键脚本启动后，用 curl 发两个共享前缀的请求，观察 `prefix_hit_blocks` 和 `kv_store=mooncake`。
 
 ### 7.2 npu-dev 模式
 

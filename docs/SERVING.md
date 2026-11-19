@@ -19,6 +19,7 @@
 | S4 | Regular DP=2 | 2 个 Regular worker + vllm-router | 2 个进程，device 0/1 | router 的 `/v1/*` | `verify_router_regular.py` 的 S4 部分 | 已验证 |
 | S5 | PD 分离 1P1D | 1 个 prefill + 1 个 decode + vllm-router | 2 个进程，device 0/1 | router 的 `/v1/*` | `verify_pd_router.py`、`run_pd_router_demo.sh` | 已验证 |
 | S6 | PD 分离多 P/多 D | N 个 prefill + M 个 decode + vllm-router | 至少 3 个 worker 槽位 | router 的 `/v1/*` | 需扩展脚本或手工 curl | 代码已支持；CPU 已验证 2P1D，NPU 受 2 卡限制未展开 |
+| S7 | Mooncake KV 存储与 Decode 拉取 | 1P1D + Mooncake Store | 2 个 worker + master | router 的 `/v1/*` | `verify_mooncake_pd.py`、`run_mooncake_pd_demo.sh` | NPU 已验证 |
 
 对应关系：
 
@@ -130,7 +131,7 @@ python scripts/verify_router_regular.py
 
 最后一个事件的 `finished` 为 `true`。调用方应以该事件作为完成标志。
 
-## 4. S1：异步引擎直调
+## 4. S1 异步引擎直调
 
 ### 4.1 使用方式
 
@@ -177,7 +178,7 @@ python scripts/verify_async_engine.py
 | `NANO_VLLM_TEMPERATURE` | `1e-5` |
 | `NANO_VLLM_DEVICE_ID` | `0` |
 
-## 5. S2：单 worker HTTP 直连
+## 5. S2 单 worker HTTP 直连
 
 ### 5.1 启动
 
@@ -311,7 +312,7 @@ python scripts/verify_api_server.py
 | `NANO_VLLM_DEVICE_ID` | `0` |
 | `NANO_VLLM_API_TIMEOUT` | `600` 秒，等待服务就绪 |
 
-## 6. S3：Regular 单实例（P/D 混部）+ vllm-router
+## 6. S3 Regular 单实例（P/D 混部）+ vllm-router
 
 ### 6.1 拓扑
 
@@ -386,12 +387,12 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 python scripts/verify_router_regular.py
 ```
 
-脚本覆盖 S3 和 S4：
+脚本覆盖 S3 和 S4
 
-- S3：启动 1 个 Regular worker 和 router，发送 4 个请求，全部应命中 `regular-1`。
-- S4：启动 2 个 Regular worker 和 router，发送 8 个请求，应同时命中 `regular-1` 和 `regular-2`。
+- S3 启动 1 个 Regular worker 和 router，发送 4 个请求，全部应命中 `regular-1`。
+- S4 启动 2 个 Regular worker 和 router，发送 8 个请求，应同时命中 `regular-1` 和 `regular-2`。
 
-## 7. S4：Regular DP=2 + vllm-router
+## 7. S4 Regular DP=2 + vllm-router
 
 ### 7.1 拓扑
 
@@ -476,7 +477,7 @@ Regular 模式下可用的请求级策略：
 - `power_of_two`：至少两个 worker。
 - `cache_aware`、`consistent_hash`：按缓存或哈希选择。
 
-## 8. S5：PD 分离 1P1D + vllm-router
+## 8. S5 PD 分离 1P1D + vllm-router
 
 ### 8.1 拓扑
 
@@ -597,7 +598,7 @@ KEEP_RUNNING=0 SMOKE_REQUEST=1 bash scripts/run_pd_router_demo.sh
 | `NANO_VLLM_ROUTER_POLICY` | `round_robin` |
 | `VLLM_ROUTER_BIN` | 自动查找 |
 
-## 9. S6：PD 分离多 P/多 D + vllm-router
+## 9. S6 PD 分离多 P/多 D + vllm-router
 
 ### 9.1 支持状态
 
@@ -722,7 +723,130 @@ curl -N http://127.0.0.1:8080/v1/completions \
 - NPU 2P2D：需要 4 个 device，当前环境未执行。
 - `scripts/verify_pd_router.py` 当前只启动 1P1D；多 P/多 D 需要扩展脚本或手工 curl。
 
-## 10. 其他模式
+## 10. S7 Mooncake KV 存储与 Decode 拉取
+
+### 10.1 拓扑
+
+```mermaid
+flowchart LR
+    C[client] --> R[vllm-router]
+    R -->|"prefill + transfer_id"| P[prefill worker<br/>device 0]
+    P -->|"put KV / state / manifest"| M[(Mooncake Store)]
+    R -->|"decode + transfer_id"| D[decode worker<br/>device 1]
+    D -->|"get manifest / KV / state"| M
+    M --- MM[mooncake_master]
+    P -.->|"/query engine_id"| R
+```
+
+prefill worker 把 KV block、Qwen3.5 状态快照和 manifest 写入 Mooncake Store；decode worker 按 router 传入的 `transfer_id` 读取 manifest，再批量拉取 KV/state。与 HTTP 中转不同，decode 不访问 prefill 的 `/internal/pd/transfer`，数据面完全走 Mooncake。
+
+### 10.2 启动 Mooncake master
+
+```bash
+mooncake_master --rpc_port 50051
+```
+
+如果 master 已经在运行，跳过这一步。安装和 smoke 验证：
+
+```bash
+bash scripts/setup_mooncake_env.sh
+python scripts/verify_mooncake_store.py
+```
+
+### 10.3 启动 prefill worker
+
+```bash
+python -m nanovllm.serving.api_server --model "$NANO_VLLM_MODEL" \
+  --host 127.0.0.1 --port 8101 --device-id 0 --role prefill \
+  --worker-id prefill-1 --advertise-url http://127.0.0.1:8101 \
+  --enforce-eager --max-model-len 512 --max-num-seqs 8 \
+  --max-num-batched-tokens 512 --gpu-memory-utilization 0.3 \
+  --kv-store mooncake \
+  --mooncake-master 127.0.0.1:50051 \
+  --mooncake-bootstrap-port 8998 \
+  --mooncake-state-snapshots block
+```
+
+`--mooncake-state-snapshots block` 让 prefill 在每个完整 block 边界保存 Qwen3.5 线性注意力状态；前缀匹配只有 KV 和 state 同时命中时才成立。`--mooncake-bootstrap-port` 是 router 启动时查询 `/query` 的端口。
+
+### 10.4 启动 decode worker
+
+```bash
+python -m nanovllm.serving.api_server --model "$NANO_VLLM_MODEL" \
+  --host 127.0.0.1 --port 8102 --device-id 1 --role decode \
+  --worker-id decode-1 --enforce-eager --max-model-len 512 \
+  --max-num-seqs 8 --max-num-batched-tokens 512 \
+  --gpu-memory-utilization 0.3 \
+  --kv-store mooncake \
+  --mooncake-master 127.0.0.1:50051
+```
+
+### 10.5 启动 vllm-router
+
+```bash
+"$VLLM_ROUTER_BIN" --host 127.0.0.1 --port 8080 \
+  --vllm-pd-disaggregation \
+  --kv-connector mooncake \
+  --prefill http://127.0.0.1:8101 8998 \
+  --decode http://127.0.0.1:8102 \
+  --policy round_robin
+```
+
+`--kv-connector mooncake` 会让 router 在启动时查询 prefill 的 `http://127.0.0.1:8998/query`，取得 `engine_id`，并在 decode 请求中注入 `transfer_id`、`remote_bootstrap_addr` 和 `remote_engine_id`。prefill 响应的自定义字段不会被转发，交接上下文由 Mooncake manifest 传递。
+
+### 10.6 curl 直发与前缀命中
+
+先发一个请求预热前缀：
+
+```bash
+PREFIX=$(python3 - <<'PY'
+print("The quick brown fox jumps over the lazy dog. " * 40)
+PY
+)
+curl -sS http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d "{\"prompt\":\"${PREFIX} Answer A.\",\"max_tokens\":8,\"temperature\":0}"
+```
+
+再发一个共享同一前缀、后缀不同的请求：
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d "{\"prompt\":\"${PREFIX} Answer B.\",\"max_tokens\":8,\"temperature\":0}"
+```
+
+第二个响应的关键字段：
+
+```json
+{
+  "kv_store": "mooncake",
+  "pd_transfer": true,
+  "worker_role": "decode",
+  "transfer_id": "xfer-...",
+  "prefix_hit_blocks": 1
+}
+```
+
+`prefix_hit_blocks` 大于 0 表示 prefill 命中了 Mooncake 中的前缀 KV/state；`kv_store=mooncake` 表示 decode 从 Mooncake 拉取。流式和 chat 请求同样发到 router。
+
+### 10.7 自动化验证
+
+```bash
+python scripts/verify_mooncake_pd.py
+```
+
+脚本启动 master、prefill worker、decode worker 和 router，发送两个共享前缀的请求，检查 `prefix_hit_blocks >= 1`、`kv_store=mooncake`、`pd_transfer=true`，确认 prefill 日志没有 `/internal/pd/transfer` 请求，并将返回文本与直接生成对拍。
+
+一键启动并发送 smoke 请求：
+
+```bash
+KEEP_RUNNING=0 SMOKE_REQUEST=1 bash scripts/run_mooncake_pd_demo.sh
+```
+
+Mooncake 内部对象、容量计算、失败模式和取舍见 [MOONCAKE_KV_DESIGN.md](MOONCAKE_KV_DESIGN.md)。
+
+## 11. 其他模式
 
 这两个模式不属于上面的主场景，保留用于调试：
 
@@ -759,7 +883,7 @@ python scripts/verify_pd.py
 python scripts/verify_pd_concurrent.py
 ```
 
-## 11. 验证脚本与场景对照
+## 12. 验证脚本与场景对照
 
 | 脚本 | 场景 | 验证内容 |
 | --- | --- | --- |
@@ -768,6 +892,9 @@ python scripts/verify_pd_concurrent.py
 | `verify_router_regular.py` | S3 + S4 | Regular 单实例命中 `regular-1`；DP=2 同时命中 `regular-1`/`regular-2` |
 | `verify_pd_router.py` | S5 | 1P1D + vllm-router，`pd_transfer=true`，流式与文本对拍 |
 | `run_pd_router_demo.sh` | S5 | 一键启动 1P1D + router 并发送 smoke 请求 |
+| `verify_mooncake_store.py` | S7 | Mooncake master 与 3 MiB/20 MiB 对象读写 |
+| `verify_mooncake_pd.py` | S7 | Mooncake KV、前缀命中和 decode 拉取 |
+| `run_mooncake_pd_demo.sh` | S7 | 一键启动 Mooncake PD 服务并发送 smoke 请求 |
 | `verify_pd.py` | 其他模式 | 单进程 PD 与直接生成 `token_ids` 一致 |
 | `verify_pd_concurrent.py` | 其他模式 | 两个并发单进程 PD 请求，覆盖 batching 和 chunked prefill |
 | `check_npu_env.py` | 环境 | NPU 设备、依赖和模型检查 |
@@ -775,13 +902,14 @@ python scripts/verify_pd_concurrent.py
 | `verify_npu_generate.py` | 离线 | 多请求 + chunked prefill 端到端对拍 |
 | `verify_npu_logits.py` | 离线 | 模型 logits 对拍 |
 
-## 12. 已知限制
+## 13. 已知限制
 
 - Regular worker 在单实例内完成 P/D，不共享 KV cache；DP 只做请求级负载均衡。
 - 每个请求的 prefill 串行执行，长 prompt 会阻塞同一 prefill worker 上的其他请求；多 P 可以横向扩展，但不改变单个 worker 内的串行行为。
 - S5/S6 通过 HTTP 拉取 KV/state，未接入 NIXL、Mooncake 或 RDMA。
 - PD 模式暂不支持 `tensor_parallel_size > 1`。
 - S6 多 P/多 D 需要至少 3 个 worker 槽位；当前 2 卡 NPU 只验证了 S5，CPU 已验证 2P1D。
+- S7 Mooncake 后端依赖 `mooncake_master` 和 Mooncake Store；当前使用 TCP，不验证 RDMA。Qwen3.5 `block` 状态快照约 20 MiB/边界，容量规划见设计文档。
 - 单进程 `--pd` 在两个 NPU device 上同时加载两个引擎，当前 A3 环境可能受 torch_npu/驱动状态影响；两卡 PD 使用 S5 的独立 worker + vllm-router。
 - 内部 `/internal/pd/transfer/{id}` 端点没有鉴权，只能用于同机或可信网络。
 - 服务没有认证、限流和指标导出。

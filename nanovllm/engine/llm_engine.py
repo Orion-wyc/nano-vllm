@@ -1,4 +1,5 @@
 import atexit
+from collections.abc import Mapping
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -10,6 +11,12 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+
+
+def _prefix_field(prefix, name, default=None):
+    if isinstance(prefix, Mapping):
+        return prefix.get(name, default)
+    return getattr(prefix, name, default)
 
 
 class LLMEngine:
@@ -108,6 +115,75 @@ class LLMEngine:
             "state": state,
             "sampling_params": sampling_params,
             "finished": seq.is_finished,
+        }
+        self.scheduler.abort(seq.seq_id)
+        return result
+
+    def prefill_with_prefix(
+        self,
+        prompt,
+        sampling_params,
+        prefix=None,
+        on_block_complete=None,
+        state_snapshot: bool = False,
+        hold_blocks: bool = True,
+    ):
+        if isinstance(prompt, str):
+            prompt = self.tokenizer.encode(prompt)
+        self._validate_request(prompt, sampling_params)
+        seq = Sequence(prompt, sampling_params)
+        block_size = self.config.kvcache_block_size
+        prefix_blocks = 0
+        prefix_tokens = 0
+        if prefix is not None:
+            prefix_blocks = int(_prefix_field(prefix, "num_blocks", 0))
+        if prefix_blocks > 0:
+            prefix_tokens = int(_prefix_field(prefix, "num_tokens", 0))
+            if prefix_tokens != prefix_blocks * block_size:
+                raise ValueError("prefix num_tokens must equal num_blocks * kvcache_block_size")
+            if prefix_tokens >= len(prompt) + 1:
+                raise ValueError("prefix must not be longer than the prompt")
+            block_ids = self.scheduler.block_manager.import_prefix_blocks(seq, prefix_blocks)
+            block_tensors = _prefix_field(prefix, "block_tensors")
+            if block_tensors:
+                self.model_runner.call("import_kv_blocks", block_ids, block_tensors)
+            prefix_state = _prefix_field(prefix, "state")
+            if prefix_state is not None:
+                self.model_runner.call("import_state", seq.state_slot, prefix_state)
+            seq.num_cached_tokens = prefix_tokens
+            if seq.num_cached_tokens >= len(prompt):
+                seq.num_cached_tokens = len(prompt) - 1
+            while len(seq.block_table) < seq.num_blocks:
+                seq.block_table.append(self.scheduler.block_manager._allocate_block())
+        if hold_blocks:
+            seq.ignore_eos = True
+            seq.max_tokens = max(seq.max_tokens, seq.num_prompt_tokens + 2)
+        seq.state_snapshot = None
+        self.scheduler.add(seq)
+        while not seq.is_finished and seq.num_cached_tokens < seq.num_prompt_tokens:
+            seqs, is_prefill = self.scheduler.schedule()
+            assert is_prefill and len(seqs) == 1 and seqs[0] is seq
+            token_ids = self.model_runner.call("run", seqs, True)
+            self.scheduler.postprocess(seqs, token_ids, True)
+            if on_block_complete is not None and seq.num_cached_tokens % block_size == 0 and seq.num_cached_tokens < seq.num_prompt_tokens:
+                if state_snapshot:
+                    seq.state_snapshot = self.model_runner.call("export_state", seq.state_slot)
+                on_block_complete(seq)
+        block_ids = list(seq.block_table)
+        kv = self.model_runner.call("export_kv", block_ids) if block_ids else None
+        state = self.model_runner.call("export_state", seq.state_slot) if seq.state_slot >= 0 else None
+        result = {
+            "token_ids": list(seq.token_ids),
+            "prompt_token_ids": list(seq.token_ids[:seq.num_prompt_tokens]),
+            "num_prompt_tokens": seq.num_prompt_tokens,
+            "block_table": block_ids,
+            "state_slot": seq.state_slot,
+            "kv": kv,
+            "state": state,
+            "sampling_params": sampling_params,
+            "finished": seq.is_finished,
+            "prefix_blocks": prefix_blocks,
+            "prefix_tokens": prefix_tokens,
         }
         self.scheduler.abort(seq.seq_id)
         return result

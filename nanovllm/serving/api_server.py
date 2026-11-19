@@ -29,7 +29,7 @@ def _usage(event) -> tuple[int, int, int]:
 
 
 def _attach_event_extras(app: FastAPI, payload: dict, event: dict) -> None:
-    for key in ("kv_transfer_params", "worker_role", "worker_id", "pd_transfer", "token_ids"):
+    for key in ("kv_transfer_params", "worker_role", "worker_id", "pd_transfer", "token_ids", "kv_store", "transfer_id", "prefix_hit_blocks", "fallback"):
         value = event.get(key)
         if value is not None:
             payload[key] = value
@@ -321,6 +321,24 @@ def main():
     )
     parser.add_argument("--kv-transfer-ttl", type=float, default=300.0)
     parser.add_argument("--kv-fetch-timeout", type=float, default=120.0)
+    parser.add_argument("--kv-store", choices=("http", "mooncake"), default="http")
+    parser.add_argument("--mooncake-master", default="127.0.0.1:50051")
+    parser.add_argument("--mooncake-metadata", default="P2PHANDSHAKE")
+    parser.add_argument("--mooncake-protocol", default="tcp")
+    parser.add_argument("--mooncake-global-segment-size", type=int, default=1024**3)
+    parser.add_argument("--mooncake-local-buffer-size", type=int, default=256 * 1024**2)
+    parser.add_argument("--mooncake-tenant", default="default")
+    parser.add_argument("--mooncake-bootstrap-port", type=int, default=8998)
+    parser.add_argument(
+        "--mooncake-state-snapshots",
+        choices=("block", "final", "none"),
+        default="block",
+    )
+    parser.add_argument(
+        "--mooncake-missing-policy",
+        choices=("error", "recompute"),
+        default="error",
+    )
     parser.add_argument("--worker-id", default=None)
     args = parser.parse_args()
     if args.worker_id is None:

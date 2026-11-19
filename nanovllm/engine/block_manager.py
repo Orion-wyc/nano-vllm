@@ -112,6 +112,15 @@ class BlockManager:
         seq.block_table = block_ids
         return block_ids
 
+    def import_prefix_blocks(self, seq: Sequence, num_blocks: int) -> list[int]:
+        assert not seq.block_table
+        block_ids = [self._allocate_block() for _ in range(num_blocks)]
+        if seq.state_slot == -1:
+            seq.state_slot = self.free_state_slots.popleft()
+            self.used_state_slots.add(seq.state_slot)
+        seq.block_table = block_ids
+        return block_ids
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]

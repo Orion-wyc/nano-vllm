@@ -94,6 +94,23 @@ def _arg(args, name, default=None):
     return getattr(args, name, default)
 
 
+def _mooncake_config(args):
+    from .mooncake_store import MooncakeStoreConfig
+
+    return MooncakeStoreConfig(
+        enabled=_arg(args, "kv_store", "http") == "mooncake",
+        master=_arg(args, "mooncake_master", "127.0.0.1:50051"),
+        metadata=_arg(args, "mooncake_metadata", "P2PHANDSHAKE"),
+        protocol=_arg(args, "mooncake_protocol", "tcp"),
+        global_segment_size=_arg(args, "mooncake_global_segment_size", 1024**3),
+        local_buffer_size=_arg(args, "mooncake_local_buffer_size", 256 * 1024**2),
+        tenant=_arg(args, "mooncake_tenant", "default"),
+        bootstrap_port=_arg(args, "mooncake_bootstrap_port", 8998),
+        state_snapshots=_arg(args, "mooncake_state_snapshots", "block"),
+        missing_policy=_arg(args, "mooncake_missing_policy", "error"),
+    )
+
+
 def _engine_kwargs(args, device_id: int) -> dict:
     kwargs = {
         "device_id": device_id,
@@ -136,11 +153,19 @@ async def create_router(args) -> BaseRouter:
             port = _arg(args, "port", 8000)
             advertise_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
             advertise_url = f"http://{advertise_host}:{port}"
-        engine = LLMEngine(model, **_engine_kwargs(args, device_id))
+        mooncake_config = _mooncake_config(args)
+        kwargs = _engine_kwargs(args, device_id)
+        if mooncake_config.enabled and mooncake_config.state_snapshots == "block":
+            kwargs["max_num_batched_tokens"] = min(
+                kwargs.get("max_num_batched_tokens", 256),
+                256,
+            )
+        engine = LLMEngine(model, **kwargs)
         router = PrefillWorkerRouter(
             engine,
             advertise_url,
             _arg(args, "kv_transfer_ttl", 300.0),
+            mooncake_config,
         )
         router.worker_id = _arg(args, "worker_id", None)
         return router
@@ -148,7 +173,11 @@ async def create_router(args) -> BaseRouter:
         from .pd_worker import DecodeWorkerRouter
 
         engine = AsyncLLMEngine(model, **_engine_kwargs(args, device_id))
-        router = DecodeWorkerRouter(engine, _arg(args, "kv_fetch_timeout", 120.0))
+        router = DecodeWorkerRouter(
+            engine,
+            _arg(args, "kv_fetch_timeout", 120.0),
+            _mooncake_config(args),
+        )
         router.worker_id = _arg(args, "worker_id", None)
         return router
     if _arg(args, "pd", False):

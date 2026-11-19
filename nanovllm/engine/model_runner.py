@@ -30,6 +30,21 @@ from nanovllm.utils.loader import load_model
 from nanovllm.utils.parallel_state import set_parallel_state
 
 
+def _stack_kv_blocks(blocks: list[torch.Tensor]) -> torch.Tensor:
+    if not blocks:
+        raise ValueError("kv blocks must not be empty")
+    stacked = []
+    for block in blocks:
+        if block.dim() == 6:
+            if block.size(2) != 1:
+                raise ValueError("6-D kv block must have a singleton block dimension")
+            block = block.squeeze(2)
+        elif block.dim() != 5:
+            raise ValueError("kv block must be 5-D or 6-D")
+        stacked.append(block)
+    return torch.stack(stacked, dim=2)
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -273,6 +288,13 @@ class ModelRunner:
         source = kv.to(self.kv_cache.device, dtype=self.kv_cache.dtype)
         for source_index, block_id in enumerate(block_ids):
             self.kv_cache[:, :, block_id].copy_(source[:, :, source_index])
+
+    def import_kv_blocks(self, block_ids: list[int], blocks: list[torch.Tensor]) -> None:
+        if len(block_ids) != len(blocks):
+            raise ValueError("block ids and kv blocks must have the same length")
+        if not blocks:
+            return
+        self.import_kv(block_ids, _stack_kv_blocks(blocks))
 
     def export_state(self, slot: int):
         if hasattr(self.model, "export_state"):
